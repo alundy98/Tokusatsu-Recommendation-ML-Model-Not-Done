@@ -1,4 +1,5 @@
 import os
+import re
 import numpy as np
 import pandas as pd
 import warnings
@@ -9,12 +10,8 @@ pd.set_option("display.max_columns", None)
 warnings.filterwarnings("ignore")
 warnings.filterwarnings("always")
 
-# List all files (for debug ig)
-for dirname, _, filenames in os.walk(r'C:\Users\alecl\OneDrive\Desktop\AL REPOS'):
-    for filename in filenames:
-        print(os.path.join(dirname, filename))
 # Load data
-data_path = r'C:\Users\alecl\OneDriv e\Desktop\AL REPOS\TokuProject.csv'
+data_path = r"C:\Users\alecl\OneDrive\Desktop\AL REPOS\TokuProject.csv"
 df = pd.read_csv(data_path)
 
 #load data and some cleaning add back the rest later for a note
@@ -60,6 +57,23 @@ kw = df['Keywords'].fillna("").str.split(",").apply(lambda x: [k.strip() for k i
 
 # Initialize multi-hot DataFrame
 x_kw = pd.DataFrame(0, index=df.index, columns=keyword_pool, dtype=int)
+#Creating full title category
+df['Series'] = df['Series'].astype(str).fillna('').str.strip()
+df['Season'] = df['Season'].astype(str).fillna('').str.strip()
+df['full_title'] = (df['Series'] + ' ' + df['Season']).str.strip()
+
+# normalization helper: lowercase + collapse whitespace
+def normalize_title(s):
+    if pd.isna(s):
+        return ''
+    s = str(s).strip().lower()
+    s = re.sub(r'\s+', ' ', s)   # collapse multiple spaces into one
+    return s
+# normalized column to match against (compute once)
+df['full_title_norm'] = df['full_title'].apply(normalize_title)
+
+def get_all_full_titles():
+    return df['full_title'].dropna().unique().tolist()
 
 # Fill multi-hot matrix
 for i, keywords in enumerate(kw):
@@ -72,32 +86,58 @@ x_fin = pd.concat([x_num, x_cat, x_kw], axis=1).fillna(0)
 
 
 #cosine_similarity from sklearn.metrics.pairwise used
-cosine_sim = cosine_similarity(x_fin)   
+cosine_sim = cosine_similarity(x_fin)
 
-def get_top5_recommendations(series, show_title, n=5, max_per_series=3):
-    # find the row for the target season
-    matches = df.index[df['Season'] == show_title]
+def get_top5_recommendations(show_title, n=5, max_per_series=3):
+    """
+    Returns top N Tokusatsu recommendations as a list of dictionaries:
+    Each dict contains: Series, Season, Similarity, Rating, Era
+    """
+    show_title = show_title.strip().lower()  # normalize input
+
+    # Find matching full_title in df
+    matches = df.index[df['full_title'].str.lower() == show_title]
+
     if len(matches) == 0:
-        raise ValueError(f"Show '{show_title}' not found")
-    idx = matches[0]
-    sim_scores = list(enumerate(cosine_sim[idx]))
-    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
-    
-    # removes the show we are matching with
-    sim_scores = sim_scores[1:]
-    results = []
-    series_count = {}
-    for i, score in sim_scores:
-        s = df.loc[i, "Series"]
-        if series_count.get(s, 0) < max_per_series:
-            results.append({
-                "Series": s,
-                "Season": df.loc[i, "Season"],
-                "Similarity": round(score, 3)
-            })
-            series_count[s] = series_count.get(s, 0) + 1
-        if len(results) >= n:
-            break
-    return results
+        # fallback: partial match (so user can type "kamen rider w" etc.)
+        matches = df.index[df['full_title'].str.lower().str.contains(show_title)]
 
-print(get_top5_recommendations('Power Rangers', "Time Force" , n=5))
+    if len(matches) == 0:
+        raise ValueError(f"Show '{show_title}' not found. Please use exact full title or select from suggestions.")
+
+    target_idx = matches[0]
+
+    # Get similarity scores for all shows
+    sims = list(enumerate(cosine_sim[target_idx]))
+    sims = sorted(sims, key=lambda x: x[1], reverse=True)[1:]  # exclude the show itself
+
+    recommendations = []
+    series_counts = {}
+
+    for idx, score in sims:
+        series = df.loc[idx, "Series"]
+        season = df.loc[idx, "Season"]
+
+        # enforce max_per_series rule
+        if series_counts.get(series, 0) >= max_per_series:
+            continue
+
+        # build dictionary with extra stats
+        rec_dict = {
+            "Series": series,
+            "Season": season,
+            "Similarity": score,
+            "Rating": df.loc[idx].get("Avg. Rating (- Outliers)", "N/A"),
+            "Era": df.loc[idx].get("Era", "N/A")
+        }
+
+        recommendations.append(rec_dict)
+        series_counts[series] = series_counts.get(series, 0) + 1
+
+        if len(recommendations) >= n:
+            break
+
+    return recommendations
+
+
+
