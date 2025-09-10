@@ -1,143 +1,144 @@
-import os
-import re
-import numpy as np
 import pandas as pd
-import warnings
-import scipy as sp
+import numpy as np
+import re
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import MultiLabelBinarizer, MinMaxScaler
 from sklearn.metrics.pairwise import cosine_similarity
+from scipy.sparse import hstack, csr_matrix
 
-pd.set_option("display.max_columns", None)
-warnings.filterwarnings("ignore")
-warnings.filterwarnings("always")
+# =========================
+# Load data safely
+# =========================
+try:
+    df = pd.read_csv("tokusatsu_shows_enriched_cleaned.csv", encoding="utf-8-sig")
+except UnicodeDecodeError:
+    df = pd.read_csv("tokusatsu_shows_enriched_cleaned.csv", encoding="latin1")
+# Create full_title for matching
+df["Year"] = pd.to_datetime(df["First Air Date"], errors="coerce").dt.year
+df["full_title"] = df["Name"].fillna("") + " (" + df["Year"].fillna(0).astype(int).astype(str) + ")"
 
-# Load data
-data_path = r"C:\Users\alecl\OneDrive\Desktop\AL REPOS\TokuProject.csv"
-df = pd.read_csv(data_path)
+# =========================
+# Helpers
+# =========================
+def parse_list_column(col):
+    def parse(x):
+        if pd.isna(x):
+            return []
+        if isinstance(x, list):
+            return [s.strip() for s in x]
+        if isinstance(x, str):
+            return [s.strip().strip("'\"") for s in x.strip("[]").split(",") if s.strip()]
+        return []
+    return col.apply(parse)
 
-#load data and some cleaning add back the rest later for a note
-df = df.drop_duplicates()
-df = df[df['Part. Rate %'].notna()]
-df['Keywords'] = df['Keywords'].fillna(df['Keywords'].dropna().mode().values[0])
-df['Series'] = df['Series'].fillna(df['Series'].dropna().mode().values[0])
-df['Director'] = df['Director'].fillna(df['Director'].dropna().mode().values[0])
-
-quant = ['Avg. Rating (- Outliers)', 'Part. Rate %', 'Season SD']
-
-# quantatative vals
-x_num = df[quant].copy()
-
-# If Part. Rate % still has '%' symbols, strip  and convert to float
-if df['Part. Rate %'].dtype == 'object':
-    x_num['Part. Rate %'] = x_num['Part. Rate %'].str.rstrip('%').astype(float)
-x_num = x_num.fillna(x_num.mean())
-
-# Nonrmalize=
-x_num = (x_num - x_num.min()) / (x_num.max() - x_num.min())
-
-X_num = x_num.fillna(x_num.mean())
-
-print(X_num.head())
-#One-Hot Encode Categorical Features
-cat = ['Series', 'Era', 'Director', 'Production Company']
-x_cat = pd.get_dummies(df[cat], prefix=cat, dummy_na=False)
-
-#Multi- hot 
-keyword_pool = [
-    'Dark', 'Apocalypse', 'Survival Game', 'Post-Apocalypse', 'Evil Organization',
-    'Time Travel', 'Dramatic', 'Mystery', 'Urban', 'Monsters',
-    'Space', 'Lighthearted', 'Legacy Factor', 'Aliens',
-    'Nature', 'Brooding', 'Gaming', 'Belt', 'Corporate/Science',
-    'Rival Riders', 'War', 'Mythology', 'Futuristic', 'Detective',
-    'Strong Team', 'School', 'Demons', 'Cheerful', 'Alternate Dimensions',
-    'Coming of Age', 'Serious', 'Comedy', 'Magic', 'Fantasy'
-]
-
-# Split keywords, clean spaces, remove empty strings
-kw = df['Keywords'].fillna("").str.split(",").apply(lambda x: [k.strip() for k in x if k.strip() != ""])
-
-# Initialize multi-hot DataFrame
-x_kw = pd.DataFrame(0, index=df.index, columns=keyword_pool, dtype=int)
-#Creating full title category
-df['Series'] = df['Series'].astype(str).fillna('').str.strip()
-df['Season'] = df['Season'].astype(str).fillna('').str.strip()
-df['full_title'] = (df['Series'] + ' ' + df['Season']).str.strip()
-
-# normalization helper: lowercase + collapse whitespace
 def normalize_title(s):
-    if pd.isna(s):
-        return ''
-    s = str(s).strip().lower()
-    s = re.sub(r'\s+', ' ', s)   # collapse multiple spaces into one
-    return s
-# normalized column to match against (compute once)
-df['full_title_norm'] = df['full_title'].apply(normalize_title)
+    return re.sub(r'\s+', ' ', str(s).strip().lower()) if pd.notna(s) else ''
 
-def get_all_full_titles():
-    return df['full_title'].dropna().unique().tolist()
+special_directors = {
+    "naruhisa arakawa","shozo uehara","keiichi hasegawa","yasuko kobayashi",
+    "toshiki inoue","sho aikawa","yuji kobayashi","seiji takaiwa","hirofumi fukuzawa",
+    "kazuo niibori","eiji tsuburaya","shotaro ishinomori","saburo yatsude",
+    "shotaro moriyasu","takao nagaishi","koichi takemoto","takashi miike",
+    "hiroshi miyauchi","kazup niibori","kenji ohba"
+}
 
-# Fill multi-hot matrix
-for i, keywords in enumerate(kw):
-    for keyword in keywords:
-        if keyword in keyword_pool:
-            x_kw.loc[i, keyword] = 1
-
-#easy big matrix to just call it instead of all 3
-x_fin = pd.concat([x_num, x_cat, x_kw], axis=1).fillna(0)
-
-
-#cosine_similarity from sklearn.metrics.pairwise used
-cosine_sim = cosine_similarity(x_fin)
-
-def get_top5_recommendations(show_title, n=5, max_per_series=3):
-    """
-    Returns top N Tokusatsu recommendations as a list of dictionaries:
-    Each dict contains: Series, Season, Similarity, Rating, Era
-    """
-    show_title = show_title.strip().lower()  # normalize input
-
-    # Find matching full_title in df
-    matches = df.index[df['full_title'].str.lower() == show_title]
-
-    if len(matches) == 0:
-        # fallback: partial match (so user can type "kamen rider w" etc.)
-        matches = df.index[df['full_title'].str.lower().str.contains(show_title)]
-
-    if len(matches) == 0:
-        raise ValueError(f"Show '{show_title}' not found. Please use exact full title or select from suggestions.")
-
-    target_idx = matches[0]
-
-    # Get similarity scores for all shows
-    sims = list(enumerate(cosine_sim[target_idx]))
-    sims = sorted(sims, key=lambda x: x[1], reverse=True)[1:]  # exclude the show itself
-
-    recommendations = []
-    series_counts = {}
-
-    for idx, score in sims:
-        series = df.loc[idx, "Series"]
-        season = df.loc[idx, "Season"]
-
-        # enforce max_per_series rule
-        if series_counts.get(series, 0) >= max_per_series:
-            continue
-
-        # build dictionary with extra stats
-        rec_dict = {
-            "Series": series,
-            "Season": season,
-            "Similarity": score,
-            "Rating": df.loc[idx].get("Avg. Rating (- Outliers)", "N/A"),
-            "Era": df.loc[idx].get("Era", "N/A")
+# =========================
+# Feature builder
+# =========================
+def build_feature_matrix(df, weights=None):
+    if weights is None:
+        weights = {
+            "overview": 2.0,
+            "age_rating": 2.0,
+            "genres": 4.0,
+            "keywords": 5.0,
+            "director": 4.0,
+            "popularity": 1.0,
+            "vote_avg": 1.0,
+            "vote_count": 0.5
         }
 
-        recommendations.append(rec_dict)
-        series_counts[series] = series_counts.get(series, 0) + 1
+    df = df.copy()
+    df["parsed_genres"] = parse_list_column(df["Genres"])
+    df["parsed_keywords"] = parse_list_column(df["Keywords"])
+    df["director_clean"] = df["Director"].fillna("Unknown").astype(str)
 
-        if len(recommendations) >= n:
+    # Overview TF-IDF
+    tfidf = TfidfVectorizer(stop_words="english")
+    x_overview = tfidf.fit_transform(df["Overview"].fillna(""))
+
+    # Genres
+    mlb_g = MultiLabelBinarizer()
+    x_genres = csr_matrix(mlb_g.fit_transform(df["parsed_genres"]).astype(np.float32))
+
+    # Keywords
+    mlb_k = MultiLabelBinarizer()
+    x_keywords = csr_matrix(mlb_k.fit_transform(df["parsed_keywords"]).astype(np.float32))
+
+    # Director one-hot + bonus
+    x_dir_df = pd.get_dummies(df["director_clean"], prefix="dir")
+    bonus_mask = x_dir_df.columns.str.lower().map(lambda d: any(sd in d for sd in special_directors))
+    if bonus_mask.any():
+        x_dir_df["dir_bonus"] = x_dir_df.loc[:, bonus_mask].sum(axis=1)
+    x_dir = csr_matrix(x_dir_df.values.astype(np.float32))
+
+    # Age Rating
+    x_age = csr_matrix(pd.get_dummies(df["Age_Rating"].fillna("Unknown"), prefix="age").values.astype(np.float32))
+
+    # Numeric features
+    num_feats = df[["Popularity", "Vote Average", "Vote Count"]].fillna(0)
+    scaler = MinMaxScaler()
+    x_num = csr_matrix(scaler.fit_transform(num_feats).astype(np.float32))
+
+    # Weighted hstack
+    feats = [
+        x_overview * weights["overview"],
+        x_age * weights["age_rating"],
+        x_genres * weights["genres"],
+        x_keywords * weights["keywords"],
+        x_dir * weights["director"],
+        x_num[:, 0] * weights["popularity"],
+        x_num[:, 1] * weights["vote_avg"],
+        x_num[:, 2] * weights["vote_count"]
+    ]
+    return hstack(feats, format="csr")
+
+# =========================
+# Build similarity
+# =========================
+feature_matrix = build_feature_matrix(df)
+cosine_sim = cosine_similarity(feature_matrix)
+
+# =========================
+# Recommender
+# =========================
+def get_recommendations(title, n=5):
+    matches = df.index[df['full_title'].str.lower() == title.lower()]
+    if not len(matches):
+        raise ValueError(f"'{title}' not found in dataset.")
+    idx = matches[0]
+
+    sim_scores = list(enumerate(cosine_sim[idx]))
+    results = []
+    for i, score in sorted(sim_scores, key=lambda x: x[1], reverse=True):
+        if i == idx:
+            continue
+        name_a = normalize_title(df.loc[idx, "Name"])
+        name_b = normalize_title(df.loc[i, "Name"])
+        if name_a.split()[0] in name_b or name_b.split()[0] in name_a:
+            score += 0.2
+        results.append({
+            "Name": df.loc[i, "Name"],
+            "Similarity": round(float(score), 4),
+            "Director": df.loc[i, "Director"],
+            "Year": df.loc[i, "Year"],
+            "Age_Rating": df.loc[i, "Age_Rating"]
+        })
+        if len(results) >= n:
             break
+    return results
 
-    return recommendations
-
-
-
+# =========================
+# Example
+# =========================
+print(get_recommendations("GARO (2005)", n=5))

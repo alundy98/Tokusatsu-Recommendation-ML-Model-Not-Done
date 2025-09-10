@@ -16,5 +16,6 @@ dependencies = [
     "requests>=2.32.5",
     "scikit-learn>=1.7.1",
     "scipy>=1.16.1",
+    "sentence-transformers>=5.1.0",
     "streamlit>=1.49.1",
 ]
